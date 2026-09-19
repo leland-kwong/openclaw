@@ -64,6 +64,11 @@ export const runtimeProcessEntrypoints = {
     sourceWorkerName: "../worker/memory-worker-entry",
     distWorkerPath: "worker/memory-worker-entry.js",
   },
+  heartbeatOutcomeStore: {
+    currentModuleUrl,
+    sourceWorkerName: "heartbeat-outcome-store.worker",
+    distWorkerPath: "infra/heartbeat-outcome-store.worker.js",
+  },
   sqliteStore: {
     currentModuleUrl,
     sourceWorkerName: "sqlite-store.worker",
