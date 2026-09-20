@@ -64,6 +64,11 @@ export const runtimeProcessEntrypoints = {
     sourceWorkerName: "../worker/memory-worker-entry",
     distWorkerPath: "worker/memory-worker-entry.js",
   },
+  boardStore: {
+    currentModuleUrl,
+    sourceWorkerName: "../boards/sqlite-board-store.worker",
+    distWorkerPath: "boards/sqlite-board-store.worker.js",
+  },
   sqliteStore: {
     currentModuleUrl,
     sourceWorkerName: "sqlite-store.worker",
