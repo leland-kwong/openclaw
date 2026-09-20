@@ -36,6 +36,13 @@ export type TaskRegistryWorkerMutationContext = {
   forcePublish?: () => TaskRecord | undefined;
 };
 
+export class TaskRegistryPublicationSupersededError extends Error {
+  constructor() {
+    super("Task publication was superseded by a current write");
+    this.name = "TaskRegistryPublicationSupersededError";
+  }
+}
+
 function* currentTasksInScope(scope: TaskRegistryMutationScope): Iterable<TaskRecord> {
   const { tasks } = getTaskRegistryProcessState();
   for (const taskId of taskIdsInScope(scope)) {
@@ -89,7 +96,7 @@ export function createTaskRegistryPublicationRecovery(
         !current ||
         !isEquivalentTaskRecord(current, expected)
       ) {
-        throw new Error("Task publication was superseded by a current write");
+        throw new TaskRegistryPublicationSupersededError();
       }
     },
   };

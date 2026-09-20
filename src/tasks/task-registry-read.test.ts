@@ -20,6 +20,7 @@ import {
   getActiveGatewayRootWorkHolders,
   resetGatewayWorkAdmission,
 } from "../process/gateway-work-admission.js";
+import { serializeAgentSchemaInspectionError } from "../state/openclaw-agent-schema-inspection-response.js";
 import {
   closeOpenClawStateDatabaseAsync,
   runOpenClawStateWriteTransaction,
@@ -33,6 +34,7 @@ import {
 } from "./task-backing-authority.js";
 import { createRunningTaskRunCoreWithReceiptAsync } from "./task-executor-create.async.js";
 import { createManagedTaskFlow, createTaskFlowForTask } from "./task-flow-registry.js";
+import { publishTaskRecordAfterAtomicStore } from "./task-registry-publication.js";
 import {
   getTaskById,
   listTaskRecordPage,
@@ -40,7 +42,7 @@ import {
 } from "./task-registry-query.js";
 import { prepareTaskRegistryRead } from "./task-registry-read.js";
 import { linkTaskToFlowById } from "./task-registry-record-api.js";
-import { tasks, taskProgressBatches } from "./task-registry-state.js";
+import { tasks, taskProgressBatches, taskRegistryLog } from "./task-registry-state.js";
 import { getTaskRegistryStore, onTaskRegistryChange } from "./task-registry.store.js";
 import { loadTaskRegistryStateFromSqliteReadOnly } from "./task-registry.store.sqlite.js";
 import { createTaskFixture } from "./task-registry.test-support.js";
@@ -353,29 +355,31 @@ describe("task registry read preparation", () => {
       let mutation: Promise<unknown> | undefined;
       let selectedBeforeMutation = false;
       try {
+        const pendingPage = listTaskRecordPage({
+          offset: 0,
+          limit: 1,
+          prepareFilter: (batch) => {
+            workMs += 20;
+            if (!mutation) {
+              selectedBeforeMutation = batch.some((task) => task.taskId === selected.taskId);
+              mutation = createRunningTaskRunCoreWithReceiptAsync({
+                runtime: selected.runtime,
+                runId: selected.runId!,
+                task: selected.task,
+                ownerKey: selected.ownerKey,
+                scopeKind: selected.scopeKind,
+                requesterSessionKey: selected.requesterSessionKey,
+                notifyPolicy: "silent",
+                deliveryStatus: "not_applicable",
+                detail: { historyGeneration: "replacement" },
+              });
+            }
+            return (task) => task.taskId === selected.taskId;
+          },
+        });
+        await Promise.race([committed.promise, pendingPage]);
         const page = await withTestTimeout(
-          listTaskRecordPage({
-            offset: 0,
-            limit: 1,
-            prepareFilter: (batch) => {
-              workMs += 20;
-              if (!mutation) {
-                selectedBeforeMutation = batch.some((task) => task.taskId === selected.taskId);
-                mutation = createRunningTaskRunCoreWithReceiptAsync({
-                  runtime: selected.runtime,
-                  runId: selected.runId!,
-                  task: selected.task,
-                  ownerKey: selected.ownerKey,
-                  scopeKind: selected.scopeKind,
-                  requesterSessionKey: selected.requesterSessionKey,
-                  notifyPolicy: "silent",
-                  deliveryStatus: "not_applicable",
-                  detail: { historyGeneration: "replacement" },
-                });
-              }
-              return (task) => task.taskId === selected.taskId;
-            },
-          }),
+          pendingPage,
           5_000,
           "Page joined an identity-changing publication",
         );
@@ -656,6 +660,62 @@ describe("task registry read preparation", () => {
         if (failureKind === "publication") {
           expect(() => earlier.getTaskById(task.taskId)).toThrow("requires preparation");
         }
+      });
+    },
+  );
+
+  it.each(["replacement", "ABA", "cleanup failure"] as const)(
+    "settles a concurrent task read after publication %s",
+    async (scenario) => {
+      await withReadState(async () => {
+        const task = createReadTask(`superseded-read-${scenario}`);
+        const store = getTaskRegistryStore();
+        const mutate = store.runAgentEventMutationAsync.bind(store);
+        const failure = new Error("Synthetic postcommit cleanup failure");
+        const warning = vi.spyOn(taskRegistryLog, "warn").mockImplementation(() => {});
+        const writes = vi
+          .spyOn(store, "runAgentEventMutationAsync")
+          .mockImplementation(async (...args) => {
+            const receipt = expectDefined(await mutate(...args), "committed task event");
+            const replacement = { ...receipt.task, task: "Newer committed task" };
+            const records =
+              scenario === "replacement" ? [replacement] : [replacement, receipt.task];
+            for (const record of records) {
+              store.upsertTaskWithDeliveryState({ task: record });
+              publishTaskRecordAfterAtomicStore(record);
+            }
+            return scenario === "cleanup failure"
+              ? { ...receipt, cleanupError: serializeAgentSchemaInspectionError(failure) }
+              : receipt;
+          });
+        emitTool(task.runId!, "accepted-before-replacement");
+        const prepared = prepareTaskRegistryRead();
+        if (scenario === "cleanup failure") {
+          await expect(prepared).rejects.toMatchObject({
+            errors: expect.arrayContaining([
+              expect.objectContaining({ message: failure.message }),
+              expect.objectContaining({
+                message: "Task publication was superseded by a current write",
+              }),
+            ]),
+          });
+        } else {
+          const read = expectDefined(await prepared, "current read after superseded publication");
+          expect(read.getTaskById(task.taskId)).toMatchObject({
+            task: scenario === "ABA" ? task.task : "Newer committed task",
+            toolUseCount: 1,
+            lastToolName: "accepted-before-replacement",
+          });
+        }
+        expect(writes).toHaveBeenCalledOnce();
+        expect(warning).toHaveBeenCalledWith(
+          "Task agent event committed before follow-up failed",
+          expect.objectContaining({ taskId: task.taskId }),
+        );
+        expect(loadTaskRegistryStateFromSqliteReadOnly().tasks.get(task.taskId)).toMatchObject({
+          task: scenario === "replacement" ? "Newer committed task" : task.task,
+          toolUseCount: 1,
+        });
       });
     },
   );

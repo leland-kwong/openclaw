@@ -2,7 +2,10 @@ import { isDeepStrictEqual } from "node:util";
 import { subagentRuns } from "../agents/subagents/registry/subagent-registry-memory.js";
 import type { AgentEventPayload } from "../infra/agent-events.js";
 import { getAgentRunContext, getAgentRunLifecycleGeneration } from "../infra/agent-run-registry.js";
-import { createSqliteLifecycleAggregateError } from "../infra/sqlite-coordinator.js";
+import {
+  createSqliteLifecycleAggregateError,
+  throwSqliteLifecycleErrors,
+} from "../infra/sqlite-coordinator.js";
 import {
   deferSqlitePostCommitPublication,
   stageSqliteTransactionState,
@@ -52,6 +55,7 @@ import {
   taskRegistryLog,
   tasks,
 } from "./task-registry-state.js";
+import { TaskRegistryPublicationSupersededError } from "./task-registry-worker-publication.js";
 import { getTaskRegistryStore, type TaskRegistryStore } from "./task-registry.store.js";
 import { isTerminalTaskStatus, type TaskRecord } from "./task-registry.types.js";
 import { getTaskRunOwner } from "./task-run-owner.js";
@@ -339,19 +343,14 @@ export const taskAgentEventMutations = {
         entry.store === store && entry.context.admission.identity.key === admission.identity.key,
     );
     const settled = await Promise.allSettled(accepted.map((entry) => entry.completion.promise));
+    // Readers prepare current committed rows after a newer write supersedes publication.
     const errors = settled.flatMap((result) =>
-      result.status === "rejected" ? [result.reason] : [],
+      result.status === "rejected" &&
+      !(result.reason instanceof TaskRegistryPublicationSupersededError)
+        ? [result.reason]
+        : [],
     );
-    if (errors.length === 1) {
-      throw errors[0];
-    }
-    if (errors.length > 1) {
-      throw createSqliteLifecycleAggregateError(
-        errors,
-        "Accepted task events failed to settle",
-        errors[0],
-      );
-    }
+    throwSqliteLifecycleErrors(errors, "Accepted task events failed to settle");
   },
 };
 
